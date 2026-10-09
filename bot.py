@@ -1,391 +1,187 @@
-"""Opt-in Telegram group migration helper.
-
-This bot intentionally does not log into personal Telegram accounts, collect
-Telegram login codes/passwords, scrape group membership, or add people without
-their action. It creates short-lived join-request links for a group admin's
-configured destination.
-"""
+"""Telegram community migration bot using only the official Bot API."""
 
 from __future__ import annotations
 
 import logging
-import os
-import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Awaitable, Callable
 
-from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import ChatMemberUpdated, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
 )
 
-from store import DestinationStore
+from config import Settings
+from database import Database
+from handlers.admin import register_admin_handlers
+from handlers.callbacks import register_callback_handlers
+from handlers.orders import cancel_conversation, register_order_handlers
+from handlers.start import chat_id_command, help_command, my_id_command, start_command
+from handlers.workers import register_worker_handlers
+from services.invite_service import InviteService
+from services.notification_service import NotificationService
+from services.order_manager import OrderManager
+from services.quota_manager import QuotaManager
+from services.task_scheduler import TaskScheduler
+from services.worker_manager import WorkerManager
 
 logger = logging.getLogger(__name__)
-GROUP_TYPES = {"group", "supergroup"}
-ADMIN_STATUSES = {"creator", "administrator"}
-INVITE_TTL = timedelta(days=7)
-INVITE_COOLDOWN_SECONDS = 30
-
-Reply = Callable[..., Awaitable[Message]]
 
 
-def _store(context: ContextTypes.DEFAULT_TYPE) -> DestinationStore:
-    return context.application.bot_data["destination_store"]
+async def _post_init(application: Application) -> None:
+    config: Settings = application.bot_data["config"]
+    database = Database(config.database_path)
+    await database.open()
+    await database.seed_administrators(config.admin_ids)
+    await database.seed_setting("action_quota", str(config.default_action_quota))
+    await database.seed_setting("quota_window_hours", str(config.quota_window_hours))
 
-
-def _is_group(chat_type: str) -> bool:
-    return chat_type in GROUP_TYPES
-
-
-def _bot_can_invite(member: object) -> bool:
-    status = getattr(member, "status", "")
-    return status == "creator" or (
-        status == "administrator" and bool(getattr(member, "can_invite_users", False))
+    quota_manager = QuotaManager(
+        database, config.default_action_quota, config.quota_window_hours
+    )
+    worker_manager = WorkerManager(database, quota_manager)
+    invite_service = InviteService(config.invite_expiry_days)
+    notifications = NotificationService(application.bot, database, config.admin_ids)
+    order_manager = OrderManager(
+        database,
+        invite_service,
+        notifications,
+        application.bot,
+        config.maximum_order_size,
+        config.migration_announcement_template,
+    )
+    scheduler = TaskScheduler(
+        database,
+        order_manager,
+        worker_manager,
+        quota_manager,
+        notifications,
+        application.bot,
+        config.scheduler_poll_seconds,
     )
 
-
-async def _source_admin_error(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> str | None:
-    """Return an explanation unless the caller is an admin in a managed group."""
-    chat = update.effective_chat
-    user = update.effective_user
-    if chat is None or user is None or not _is_group(chat.type):
-        return "Run this command in the source group."
-
-    try:
-        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
-        if getattr(bot_member, "status", "") not in ADMIN_STATUSES:
-            return (
-                "Please make me an administrator in this source group so I can "
-                "verify who is allowed to configure it."
-            )
-        user_member = await context.bot.get_chat_member(chat.id, user.id)
-    except TelegramError:
-        logger.info("Could not verify group administrator permissions")
-        return (
-            "I couldn't verify permissions. Make sure I am an administrator in "
-            "the source group, then try again."
-        )
-
-    if getattr(user_member, "status", "") not in ADMIN_STATUSES:
-        return "Only a source-group administrator can change this configuration."
-    return None
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None:
-        return
-
-    text = (
-        "Hi! I'm an opt-in group migration helper. I can provide a time-limited "
-        "link that lets people request to join a destination group. I don't log "
-        "into personal accounts, collect Telegram login codes or passwords, "
-        "scrape member lists, or add people automatically.\n\n"
-        "A group admin can configure a destination with /setdestination in the "
-        "source group. Members can then use /invite to request their own invite. "
-        "Use /help for setup details."
+    application.bot_data.update(
+        {
+            "database": database,
+            "quota_manager": quota_manager,
+            "worker_manager": worker_manager,
+            "invite_service": invite_service,
+            "notifications": notifications,
+            "order_manager": order_manager,
+            "task_scheduler": scheduler,
+        }
     )
-    if _is_group(chat.type):
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Get opt-in invite", callback_data="optin_invite")]]
-        )
-        await message.reply_text(text, reply_markup=keyboard)
-    else:
-        await message.reply_text(text)
+    scheduler.start()
+    logger.info("Telegram migration bot initialized; secrets are not logged")
 
 
-async def chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is not None and chat is not None:
-        await message.reply_text(f"This chat's ID is {chat.id}.")
+async def _post_stop(application: Application) -> None:
+    scheduler = application.bot_data.get("task_scheduler")
+    if scheduler is not None:
+        await scheduler.stop()
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
-        return
-    await message.reply_text(
-        "Setup (admins):\n"
-        "1. Add this bot as an administrator to both groups. In the destination, "
-        "it needs permission to invite users.\n"
-        "2. In the source group, run /setdestination followed by the destination "
-        "group's @username or numeric chat ID. For a private group, use /chatid "
-        "there to see its ID. You must be an administrator in both groups.\n"
-        "3. Members use /invite in the source group. The generated link expires "
-        "after 7 days and asks the destination admins to approve each join request.\n\n"
-        "Admin commands: /status and /cleardestination.\n"
-        "This bot only facilitates voluntary join requests; it does not transfer "
-        "or enumerate members."
-    )
+async def _post_shutdown(application: Application) -> None:
+    database = application.bot_data.get("database")
+    if database is not None:
+        await database.close()
 
 
-def _clear_invite_cache(context: ContextTypes.DEFAULT_TYPE, source_chat_id: int) -> None:
-    cache: dict[tuple[int, int], tuple[str, float]] = context.application.bot_data.get(
-        "invite_link_cache", {}
-    )
-    for key in list(cache):
-        if key[0] == source_chat_id:
-            cache.pop(key, None)
-
-
-async def set_destination(
+async def _handle_chat_member(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if message is None or chat is None or user is None:
+    member_update: ChatMemberUpdated | None = update.chat_member
+    if member_update is None:
         return
-
-    error = await _source_admin_error(update, context)
-    if error:
-        await message.reply_text(error)
+    old_member = member_update.old_chat_member
+    new_member = member_update.new_chat_member
+    old_is_member = getattr(old_member, "status", "") in {
+        "member",
+        "administrator",
+        "creator",
+    } or bool(getattr(old_member, "is_member", False))
+    new_is_member = getattr(new_member, "status", "") in {
+        "member",
+        "administrator",
+        "creator",
+    } or bool(getattr(new_member, "is_member", False))
+    if old_is_member or not new_is_member:
         return
-    if len(context.args) != 1:
-        await message.reply_text(
-            "Usage: /setdestination @groupusername (or /setdestination -1001234567890)"
-        )
+    invite = member_update.invite_link
+    if invite is None:
         return
-
     try:
-        destination = await context.bot.get_chat(context.args[0])
-    except TelegramError:
-        logger.info("Could not resolve requested destination group")
-        await message.reply_text(
-            "I couldn't access that destination. Use its @username or numeric chat "
-            "ID, and make sure I have been added there."
+        await context.application.bot_data["order_manager"].record_chat_member_join(
+            member_update.chat.id,
+            invite.invite_link,
+            new_member.user.id,
         )
-        return
+    except Exception as exc:  # noqa: BLE001 - sanitize and isolate all join-update failures
+        # Do not log raw Telegram objects, invite URLs, usernames, or error text.
+        logger.error("Join update processing failed (%s)", type(exc).__name__)
 
-    if not _is_group(destination.type):
-        await message.reply_text("The destination must be a group or supergroup.")
-        return
-    if destination.id == chat.id:
-        await message.reply_text("The destination must be different from this source group.")
-        return
 
-    try:
-        destination_bot = await context.bot.get_chat_member(
-            destination.id, context.bot.id
-        )
-        destination_admin = await context.bot.get_chat_member(destination.id, user.id)
-    except TelegramError:
-        logger.info("Could not verify destination group permissions")
-        await message.reply_text(
-            "I couldn't verify destination permissions. Add me as an administrator "
-            "there with permission to invite users, and make sure you are also an "
-            "administrator, then try again."
-        )
-        return
-
-    if not _bot_can_invite(destination_bot):
-        await message.reply_text(
-            "I must be an administrator in the destination with permission to "
-            "invite users so I can create join-request links."
-        )
-        return
-    if getattr(destination_admin, "status", "") not in ADMIN_STATUSES:
-        await message.reply_text(
-            "You must also be an administrator in the destination group."
-        )
-        return
-
-    title = destination.title or destination.username or str(destination.id)
-    _store(context).set(chat.id, destination.id, title)
-    _clear_invite_cache(context, chat.id)
-    await message.reply_text(
-        f"Destination set to {title}. Members can now use /invite to request "
-        "their own join link."
+async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    logger.error(
+        "Unhandled Telegram update error (%s)",
+        type(error).__name__ if error else "unknown",
     )
-
-
-async def clear_destination(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None:
-        return
-    error = await _source_admin_error(update, context)
-    if error:
-        await message.reply_text(error)
-        return
-
-    if _store(context).remove(chat.id):
-        _clear_invite_cache(context, chat.id)
-        await message.reply_text("Destination configuration cleared for this source group.")
-    else:
-        await message.reply_text("No destination is configured for this source group.")
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None:
-        return
-    if not _is_group(chat.type):
-        await message.reply_text("Use /status inside a configured source group.")
-        return
-
-    destination = _store(context).get(chat.id)
-    if destination is None:
-        await message.reply_text(
-            "No destination is configured. A group admin can use "
-            "/setdestination @groupusername."
-        )
-        return
-    await message.reply_text(
-        f"Opt-in destination: {destination.title} ({destination.chat_id}).\n"
-        "Use /invite to create a 7-day join-request link."
-    )
-
-
-def _cooldown_remaining(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
-) -> int:
-    now = time.monotonic()
-    cooldowns: dict[tuple[int, int], float] = context.application.bot_data.setdefault(
-        "invite_cooldowns", {}
-    )
-    # Bound the in-memory map for a long-running bot.
-    for key, last_used in list(cooldowns.items()):
-        if now - last_used > 3600:
-            cooldowns.pop(key, None)
-    last_used = cooldowns.get((chat_id, user_id))
-    if last_used is None:
-        return 0
-    return max(0, int(INVITE_COOLDOWN_SECONDS - (now - last_used) + 0.999))
-
-
-async def _issue_invite(
-    chat_id: int,
-    chat_type: str,
-    user_id: int,
-    reply: Reply,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not _is_group(chat_type):
-        await reply("Use /invite inside the source group.")
-        return
-
-    destination = _store(context).get(chat_id)
-    if destination is None:
-        await reply("No destination is configured for this source group yet.")
-        return
-
-    remaining = _cooldown_remaining(context, chat_id, user_id)
-    if remaining:
-        await reply(f"Please wait {remaining} seconds before requesting another link.")
-        return
-
-    cache: dict[tuple[int, int], tuple[str, float]] = context.application.bot_data.setdefault(
-        "invite_link_cache", {}
-    )
-    cache_key = (chat_id, destination.chat_id)
-    now = time.monotonic()
-    cached = cache.get(cache_key)
-    invite_url = cached[0] if cached and cached[1] - now > 60 else None
-
-    if invite_url is None:
+    if isinstance(update, Update) and update.effective_message:
         try:
-            invite = await context.bot.create_chat_invite_link(
-                chat_id=destination.chat_id,
-                name="Opt-in group move",
-                expire_date=datetime.now(timezone.utc) + INVITE_TTL,
-                creates_join_request=True,
+            await update.effective_message.reply_text(
+                "Something went wrong while processing that request. No credentials were stored; please try again or contact an administrator."
             )
-        except TelegramError:
-            logger.exception("Could not create an opt-in join-request link")
-            await reply(
-                "I couldn't create the link. Please ask a destination-group admin to "
-                "check that I still have permission to invite users."
+        except TelegramError as exc:
+            logger.debug(
+                "Could not send the generic error reply (%s)", type(exc).__name__
             )
-            return
-        invite_url = invite.invite_link
-        cache[cache_key] = (invite_url, now + INVITE_TTL.total_seconds())
 
-    cooldowns = context.application.bot_data["invite_cooldowns"]
-    cooldowns[(chat_id, user_id)] = time.monotonic()
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Request to join destination", url=invite_url)]]
+
+def build_application(config: Settings) -> Application:
+    application = (
+        Application.builder()
+        .token(config.bot_token)
+        .post_init(_post_init)
+        .post_stop(_post_stop)
+        .post_shutdown(_post_shutdown)
+        .build()
     )
-    await reply(
-        f"Tap below to request to join {destination.title}. The link expires in "
-        "7 days, and destination admins will review your request.",
-        reply_markup=keyboard,
-    )
+    application.bot_data["config"] = config
 
-
-async def invite_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if message is None or chat is None or user is None:
-        return
-    await _issue_invite(chat.id, chat.type, user.id, message.reply_text, context)
-
-
-async def invite_button(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    query = update.callback_query
-    if query is None:
-        return
-    message = query.message
-    if message is None or not callable(getattr(message, "reply_text", None)):
-        await query.answer("Please use /invite in the source group.", show_alert=True)
-        return
-    await query.answer()
-    await _issue_invite(
-        message.chat.id,
-        message.chat.type,
-        query.from_user.id,
-        message.reply_text,
-        context,
-    )
-
-
-def build_application(token: str, data_path: Path) -> Application:
-    application = Application.builder().token(token).build()
-    application.bot_data["destination_store"] = DestinationStore(data_path)
-    application.add_handler(CommandHandler("start", start))
+    # The order conversation is registered before the general menu callback,
+    # so its create-order button enters the correct state machine.
+    register_order_handlers(application)
+    register_worker_handlers(application)
+    register_admin_handlers(application)
+    register_callback_handlers(application)
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("myid", my_id_command))
     application.add_handler(CommandHandler("chatid", chat_id_command))
-    application.add_handler(CommandHandler("setdestination", set_destination))
-    application.add_handler(CommandHandler("cleardestination", clear_destination))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("invite", invite_command))
+    application.add_handler(CommandHandler("cancel", cancel_conversation))
     application.add_handler(
-        CallbackQueryHandler(invite_button, pattern=r"^optin_invite$")
+        ChatMemberHandler(_handle_chat_member, ChatMemberHandler.CHAT_MEMBER)
     )
+    application.add_error_handler(_handle_error)
     return application
 
 
 def main() -> None:
+    try:
+        config = Settings.from_env()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        level=config.log_level,
     )
-    token = os.getenv("BOT_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("Set BOT_TOKEN in the environment before starting the bot.")
-
-    data_path = Path(os.getenv("BOT_DATA_PATH", "data/groups.json"))
-    application = build_application(token, data_path)
-    application.run_polling()
+    if not config.admin_ids:
+        logger.warning("ADMIN_IDS is empty; all administrator commands are disabled")
+    application = build_application(config)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
